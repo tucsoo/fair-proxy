@@ -2,7 +2,7 @@ const http = require('http');
 const https = require('https');
 
 const PORT = process.env.PORT || 3000;
-const TARGET = process.env.TARGET || 'www.fair.lol';
+const TARGET = process.env.TARGET || 'api.fair.lol';
 
 const server = http.createServer((req, res) => {
   // Health check
