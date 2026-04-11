@@ -1,96 +1,83 @@
 const http = require('http');
 const https = require('https');
-
 const PORT = process.env.PORT || 3000;
 
-// Connect to api.fair.lol IP but present as www.fair.lol
-const FASTLY_IP = '151.101.2.15';
-const SNI_HOST = 'www.fair.lol';
-const API_HOST = 'api.fair.lol';
+const captured = [];
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
+  // Health check
+  if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', mode: 'sni-spoof', sni: SNI_HOST, ip: FASTLY_IP }));
+    return res.end(JSON.stringify({ status: 'ok', mode: 'forward-proxy', captured: captured.length }));
+  }
+
+  // Retrieve/clear captured webhooks
+  if (req.url === '/captured') {
+    if (req.method === 'DELETE') captured.length = 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(req.method === 'DELETE' ? { cleared: true } : captured));
+  }
+
+  // Capture mode (webhook interception for inflate)
+  if (req.url === '/capture') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        captured.push({ ts: Date.now(), data: JSON.parse(body) });
+        if (captured.length > 50) captured.shift();
+      } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ captured: true, total: captured.length }));
+    });
     return;
   }
 
-  // Test different modes via query param
-  const url = new URL(req.url, `http://localhost`);
-  const mode = url.searchParams.get('_mode') || 'www';
-
-  let hostname, servername, hostHeader;
-  if (mode === 'api') {
-    // Direct to api.fair.lol
-    hostname = API_HOST;
-    servername = API_HOST;
-    hostHeader = API_HOST;
-  } else if (mode === 'ip-www') {
-    // Connect to Fastly IP with SNI=www.fair.lol
-    hostname = FASTLY_IP;
-    servername = SNI_HOST;
-    hostHeader = SNI_HOST;
-  } else if (mode === 'ip-api') {
-    // Connect to Fastly IP with SNI=api.fair.lol
-    hostname = FASTLY_IP;
-    servername = API_HOST;
-    hostHeader = API_HOST;
-  } else {
-    // Default: connect to api.fair.lol DNS but with SNI=www.fair.lol
-    hostname = API_HOST;
-    servername = SNI_HOST;
-    hostHeader = SNI_HOST;
+  // Forward mode: relay any method to X-Target-Url
+  const targetUrl = req.headers['x-target-url'];
+  if (!targetUrl) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'X-Target-Url header required' }));
   }
 
-  const targetPath = req.url.replace(/[?&]_mode=[^&]+/, '').replace(/\?$/, '');
   let body = '';
-
-  req.on('data', chunk => { body += chunk; });
+  req.on('data', c => body += c);
   req.on('end', () => {
-    const headers = { ...req.headers };
-    delete headers.host;
-    headers.host = hostHeader;
+    const url = new URL(targetUrl);
+    const isHttps = url.protocol === 'https:';
+    const mod = isHttps ? https : http;
 
-    if (body) {
-      headers['content-length'] = Buffer.byteLength(body);
+    // Forward all headers except proxy-internal ones
+    const fwdHeaders = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const lk = k.toLowerCase();
+      if (['host', 'x-target-url', 'content-length', 'connection', 'transfer-encoding'].includes(lk)) continue;
+      fwdHeaders[k] = v;
     }
+    if (body) fwdHeaders['content-length'] = Buffer.byteLength(body);
 
-    const proxyReq = https.request({
-      hostname: hostname,
-      servername: servername,
-      path: targetPath,
+    const proxyReq = mod.request({
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
       method: req.method,
-      headers: headers,
-      rejectUnauthorized: false // allow cert mismatch
-    }, (proxyRes) => {
-      const respHeaders = { ...proxyRes.headers };
-      respHeaders['access-control-allow-origin'] = '*';
-      respHeaders['access-control-allow-headers'] = '*';
-      respHeaders['access-control-allow-methods'] = '*';
-      respHeaders['x-proxy-mode'] = mode;
-      respHeaders['x-proxy-host'] = hostHeader;
-      respHeaders['x-proxy-sni'] = servername;
-
-      res.writeHead(proxyRes.statusCode, respHeaders);
-      proxyRes.pipe(res);
+      headers: fwdHeaders,
+    }, proxyRes => {
+      let rb = '';
+      proxyRes.on('data', c => rb += c);
+      proxyRes.on('end', () => {
+        // Forward all response headers back
+        const rh = {};
+        for (const [k, v] of Object.entries(proxyRes.headers)) rh[k] = v;
+        res.writeHead(proxyRes.statusCode, rh);
+        res.end(rb);
+      });
     });
-
-    proxyReq.on('error', (e) => {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'proxy_error', message: e.message, mode, hostname, servername }));
-    });
-
-    proxyReq.setTimeout(15000, () => {
-      proxyReq.destroy();
-      res.writeHead(504, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'timeout' }));
-    });
-
+    proxyReq.on('error', e => { res.writeHead(502); res.end(JSON.stringify({ error: e.message })); });
+    proxyReq.setTimeout(15000, () => { proxyReq.destroy(); res.writeHead(504); res.end('timeout'); });
     if (body) proxyReq.write(body);
     proxyReq.end();
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Proxy on :${PORT} | Modes: www (default), api, ip-www, ip-api`);
-});
+server.listen(PORT, () => console.log(`Forward proxy :${PORT} | /health /capture /captured`));
